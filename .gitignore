@@ -1,0 +1,14 @@
+# Python virtual environments
+venv/
+.venv/
+
+# PyCharm
+.idea/
+
+# Audio files
+*.mp3
+*.wav
+
+# Python cache
+__pycache__/
+*.pyc
