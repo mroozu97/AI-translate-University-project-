@@ -2,7 +2,10 @@ import deepl
 from faster_whisper import WhisperModel
 from audio import start_live_listener
 
-DEEPL_AUTH_KEY = "8943ef91-8994-48c9-84e0-d0b6e5d29ccf:fx"
+with open("token.txt", "r", encoding="utf-8") as token_file:
+    token = token_file.read()
+
+DEEPL_AUTH_KEY = token
 
 def main():
     deepl_client = deepl.DeepLClient(DEEPL_AUTH_KEY)

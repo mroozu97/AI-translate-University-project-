@@ -12,3 +12,5 @@ venv/
 # Python cache
 __pycache__/
 *.pyc
+
+*app/token.txt
