@@ -1,20 +1,13 @@
+# audio.py
 import queue
 import threading
-import re
 
 import numpy as np
 import sounddevice as sd
 import deepl
-
 from scipy.signal import butter, lfilter, resample_poly
 
-# --- AI denoiser (DeepFilterNet) ---
-try:
-    from df.enhance import enhance, init_df
-    _DF_MODEL, _DF_STATE, _ = init_df()
-    HAS_DF = True
-except Exception:
-    HAS_DF = False
+from ai_controller import AIController, AIControllerConfig, decide_send_to_asr
 
 
 def start_live_listener(
@@ -30,158 +23,36 @@ def start_live_listener(
     silence_threshold: float = 0.012,
     silence_ms_to_end: int = 650,
     max_phrase_ms: int = 6000,
-    use_ai_denoise: bool = True,
     highpass_hz: float = 80.0,
     limiter_target: float = 0.9,
+    debug_ai: bool = False,
 ):
     """
-    Live listener:
+    Live listener (bez DeepFilterNet):
     - nagrywanie w 48kHz
-    - (opcjonalnie) AI denoise (DeepFilterNet) per fraza
-    - high-pass + limiter
+    - high-pass + limiter (DSP)
+    - autorski AIController: klasyfikacja segmentu (SILENCE/NOISE/SPEECH/COMMAND) + intent detection (STOP/CHANGE_LANG)
     - resampling do 16kHz dla Whisper
     - transkrypcja + tłumaczenie DeepL
-    - STOP jeśli usłyszy zadaną frazę
-    - ZMIANA JĘZYKA tłumaczenia komendą głosową w trakcie działania
+    - STOP oraz zmiana języka tłumaczenia komendą głosową
     """
 
-    # =========================
-    # Komendy głosowe
-    # =========================
+    # ---- Autorski kontroler AI (nasz moduł) ----
+    # cfg = AIControllerConfig(samplerate=input_samplerate)
+    cfg = AIControllerConfig(
+        samplerate=input_samplerate,
+        min_segment_ms=120,
+        speech_score_threshold=0.48,
+        command_rms_factor=1.8,
+    )
 
-    # Fraza kończąca (znormalizowana)
-    STOP_PHRASES = [
-        "zegnaj gulu widzimy sie w piekle",
-        "żegnaj gulu widzimy się w piekle",
-        "żegnaj gólu widzimy się w piekle",
-    ]
+    controller = AIController(cfg)
 
-    # Mapowanie nazw języków (po polsku i po angielsku) -> kody DeepL target_lang
-
-    LANG_ALIASES = {
-        # English
-        "angielski": "EN-GB",
-        "english": "EN-GB",
-        "angielski brytyjski": "EN-GB",
-        "english uk": "EN-GB",
-        "angielski amerykanski": "EN-US",
-        "angielski amerykański": "EN-US",
-        "english us": "EN-US",
-        "american english": "EN-US",
-
-        # German
-        "niemiecki": "DE",
-        "german": "DE",
-
-        # French
-        "francuski": "FR",
-        "french": "FR",
-
-        # Spanish
-        "hiszpanski": "ES",
-        "hiszpański": "ES",
-        "spanish": "ES",
-
-        # Italian
-        "wloski": "IT",
-        "włoski": "IT",
-        "italian": "IT",
-
-        # Dutch
-        "holenderski": "NL",
-        "niderlandzki": "NL",
-        "dutch": "NL",
-
-        # Polish
-        "polski": "PL",
-        "polish": "PL",
-
-        # Portuguese
-        "portugalski": "PT-PT",     # możesz woleć PT-PT
-        "portuguese": "PT-PT",
-        "portugalski brazylijski": "PT-BR",
-        "brazylijski portugalski": "PT-BR",
-        "portuguese brazil": "PT-BR",
-
-        # Japanese
-        "japonski": "JA",
-        "japoński": "JA",
-        "japanese": "JA",
-
-        # Chinese (simplified)
-        "chinski": "ZH",
-        "chiński": "ZH",
-        "chinese": "ZH",
-
-        # Russian
-        "rosyjski": "RU",
-        "russian": "RU",
-
-        # Ukrainian
-        "ukrainski": "UK",
-        "ukraiński": "UK",
-        "ukrainian": "UK",
-    }
-
-    # Wzorce komend zmiany języka
-    # Przykłady, które zadziałają:
-    # - "zmień język na angielski"
-    # - "zmien jezyk na niemiecki"
-    # - "tłumacz na francuski"
-    # - "tlumacz na spanish"
-    # - "ustaw język tłumaczenia na włoski"
-    CHANGE_LANG_PATTERNS = [
-        r"\bzmie[nń]\s+jezyk\s+na\s+(.+)$",
-        r"\bzmie[nń]\s+język\s+na\s+(.+)$",
-        r"\bt[łl]umacz\s+na\s+(.+)$",
-        r"\bustaw\s+jezyk\s+(?:t[łl]umaczenia\s+)?na\s+(.+)$",
-        r"\bustaw\s+język\s+(?:t[łl]umaczenia\s+)?na\s+(.+)$",
-        r"\btranslate\s+to\s+(.+)$",
-    ]
-
-    # Aktualny język docelowy (może się zmieniać w trakcie działania)
+    # ---- Język docelowy tłumaczenia (zmieniany komendą) ----
     lang_lock = threading.Lock()
-    current_target_lang = {"code": deepl_target_lang}  # trzymamy w dict, żeby łatwo modyfikować z wnętrza funkcji
+    current_target_lang = {"code": deepl_target_lang}
 
-    def normalize_text(txt: str) -> str:
-        txt = txt.lower()
-        txt = re.sub(r"[^\w\sąćęłńóśżź]", "", txt)   # usuń interpunkcję, zostaw polskie znaki
-        txt = re.sub(r"\s+", " ", txt).strip()
-        return txt
-
-    def try_parse_lang_command(normalized_text: str) -> str | None:
-        """
-        Zwraca kod języka DeepL (np. 'DE', 'EN-GB') jeśli wykryje komendę zmiany języka,
-        w przeciwnym razie None.
-        """
-        for pat in CHANGE_LANG_PATTERNS:
-            m = re.search(pat, normalized_text)
-            if not m:
-                continue
-
-            raw_lang = m.group(1).strip()
-            # czasem whisper dopisze końcówki typu "proszę", "teraz" — obetnij na końcu
-            raw_lang = re.sub(r"\b(prosze|proszę|teraz|dziekuje|dziękuję)\b$", "", raw_lang).strip()
-
-            # dopasowanie aliasów
-            if raw_lang in LANG_ALIASES:
-                return LANG_ALIASES[raw_lang]
-
-            # spróbuj dopasować po "pierwszych słowach"
-            # np. "angielski brytyjski" itp.
-            # albo gdy whisper rozbije: "angielski brytyjski prosze"
-            for k, v in LANG_ALIASES.items():
-                if raw_lang.startswith(k):
-                    return v
-
-            return None
-
-        return None
-
-    # =========================
-    # Audio pipeline
-    # =========================
-
+    # ---- Kolejka fraz + stop flag ----
     phrase_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=5)
     stop_flag = threading.Event()
 
@@ -189,6 +60,7 @@ def start_live_listener(
     silence_chunks_to_end = max(1, silence_ms_to_end // chunk_ms)
     max_phrase_chunks = max(1, max_phrase_ms // chunk_ms)
 
+    # ---- DSP ----
     def rms(x: np.ndarray) -> float:
         return float(np.sqrt(np.mean(np.square(x))) + 1e-12)
 
@@ -197,37 +69,28 @@ def start_live_listener(
         norm = cutoff / nyq
         return butter(order, norm, btype="highpass")
 
-    def apply_highpass(x: np.ndarray, fs: int) -> np.ndarray:
-        if highpass_hz <= 0:
+    def apply_highpass(x: np.ndarray, fs: int, cutoff: float) -> np.ndarray:
+        if cutoff <= 0:
             return x
-        b, a = butter_highpass(highpass_hz, fs)
+        b, a = butter_highpass(cutoff, fs)
         return lfilter(b, a, x).astype(np.float32)
 
-    def limiter(x: np.ndarray) -> np.ndarray:
+    def limiter(x: np.ndarray, target_peak: float = 0.9) -> np.ndarray:
         peak = float(np.max(np.abs(x)) + 1e-12)
-        if peak > limiter_target:
-            x *= limiter_target / peak
+        if peak > target_peak:
+            x *= target_peak / peak
         return np.clip(x, -1.0, 1.0).astype(np.float32)
 
-    def ai_denoise(x: np.ndarray) -> np.ndarray:
-        if not (use_ai_denoise and HAS_DF):
-            return x
-        try:
-            y, _ = enhance(_DF_MODEL, _DF_STATE, x)
-            return y.astype(np.float32)
-        except Exception:
-            return x
-
     def enhance_pipeline(x: np.ndarray) -> np.ndarray:
-        x = (x - np.mean(x)).astype(np.float32)  # DC offset
-        x = apply_highpass(x, input_samplerate)  # HPF
-        x = ai_denoise(x)                        # AI denoise
-        x = limiter(x)                           # limiter
+        x = (x - np.mean(x)).astype(np.float32)          # DC offset
+        x = apply_highpass(x, input_samplerate, highpass_hz)
+        x = limiter(x, limiter_target)
         return x.astype(np.float32)
 
     def to_whisper_rate(x: np.ndarray) -> np.ndarray:
         return resample_poly(x, whisper_samplerate, input_samplerate).astype(np.float32)
 
+    # ---- Worker: AI gating -> Whisper -> intent -> DeepL ----
     def worker():
         while not stop_flag.is_set():
             try:
@@ -235,7 +98,24 @@ def start_live_listener(
             except queue.Empty:
                 continue
 
-            audio_48k = enhance_pipeline(audio_48k)
+            # DSP
+            audio_48k = enhance_pipeline(audio_48k.astype(np.float32))
+
+            # ✅ Nasz AI: decyzja czy segment wysyłać do ASR
+            send, feats, cls = decide_send_to_asr(controller, audio_48k)
+
+            if debug_ai:
+                print(
+                    f"[AI] cls={cls:<7} score={feats.score:.2f} "
+                    f"rms={feats.rms:.4f} zcr={feats.zcr:.3f} "
+                    f"cent={feats.centroid_hz:.0f}Hz tilt={feats.tilt_db:.1f}"
+                )
+
+            if not send:
+                # SILENCE/NOISE -> pomijamy (oszczędzamy Whisper)
+                continue
+
+            # Resampling pod Whisper
             audio_16k = to_whisper_rate(audio_48k)
 
             # delikatne podbicie jeśli za cicho
@@ -243,6 +123,7 @@ def start_live_listener(
             if peak < 0.15:
                 audio_16k = np.clip(audio_16k * (0.15 / peak), -1.0, 1.0).astype(np.float32)
 
+            # ASR
             segments, _ = whisper_model.transcribe(
                 audio_16k,
                 language=whisper_language,
@@ -258,27 +139,25 @@ def start_live_listener(
                 continue
 
             original = " ".join(texts).strip()
-            normalized = normalize_text(original)
 
-            # ✅ 1) STOP
-            for stop_phrase in STOP_PHRASES:
-                if stop_phrase in normalized:
-                    print("\n☠️ Wykryto frazę kończącą:")
-                    print(f"👉 \"{original}\"")
-                    print("⏹️ Zamykanie programu...")
-                    stop_flag.set()
-                    return
+            # ✅ Nasz AI: intent detection na bazie transkrypcji
+            intent = controller.detect_intent(original)
 
-            # ✅ 2) ZMIANA JĘZYKA
-            new_lang = try_parse_lang_command(normalized)
-            if new_lang is not None:
+            if intent.type == "STOP":
+                print("\n☠️ Wykryto frazę kończącą:")
+                print(f"👉 \"{original}\"")
+                print("⏹️ Zamykanie programu...")
+                stop_flag.set()
+                return
+
+            if intent.type == "CHANGE_LANG" and intent.payload:
                 with lang_lock:
-                    current_target_lang["code"] = new_lang
-                print("\n🔁 Zmieniono język tłumaczenia na:", new_lang)
+                    current_target_lang["code"] = intent.payload
+                print("\n🔁 Zmieniono język tłumaczenia na:", intent.payload)
                 print("-" * 40)
                 continue  # nie tłumacz samej komendy
 
-            # ✅ 3) NORMALNE TŁUMACZENIE
+            # NORMALNE TŁUMACZENIE
             with lang_lock:
                 target_lang_now = current_target_lang["code"]
 
@@ -295,18 +174,18 @@ def start_live_listener(
     threading.Thread(target=worker, daemon=True).start()
 
     print("🎧 Start nasłuchu (CTRL+C aby przerwać)")
-    # if use_ai_denoise and not HAS_DF:
-    #     print("⚠️ DeepFilterNet niedostępny (działa bez AI).")
-
     print("🗣️ Komendy:")
     print(" - „tłumacz na angielski / niemiecki / francuski ...”")
     print(" - „zmień język na angielski amerykański”")
     print(" - STOP: „Żegnaj, Gulu. Widzimy się w piekle.”")
+    if debug_ai:
+        print(" - debug_ai=True: wypisuje cechy i klasyfikację AI")
     print("-" * 40)
 
+    # ---- Pętla nagrywania + segmentacja RMS ----
     started = False
     silent_chunks = 0
-    frames = []
+    frames: list[np.ndarray] = []
     phrase_chunks = 0
 
     try:
@@ -353,10 +232,3 @@ def start_live_listener(
     finally:
         stop_flag.set()
         print("✅ Zakończono.")
-
-
-# if __name__ == "__main__":
-#     from faster_whisper import WhisperModel
-#     whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-#     deepl_client = deepl.DeepLClient("YOUR_DEEPL_API_KEY")
-#     start_live_listener(whisper_model, deepl_client)

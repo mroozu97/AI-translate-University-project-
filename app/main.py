@@ -20,9 +20,9 @@ def main():
         whisper_language="pl",
         deepl_source_lang="PL",
         deepl_target_lang="EN-GB",
-        silence_ms_to_end=1400,  # skraca „czekanie na ciszę”
+        silence_ms_to_end=450,  # skraca „czekanie na ciszę”
         max_phrase_ms=12000,
-        chunk_ms=50,            # krótsze frazy -> szybciej reaguje
+        chunk_ms=30,            # krótsze frazy -> szybciej reaguje
     )
 
 if __name__ == "__main__":
